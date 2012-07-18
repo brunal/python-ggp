@@ -1,0 +1,144 @@
+#!/usr/bin/env python
+
+# Copyright Gregory Kuhlmann <kuhlmann@cs.utexas.edu>
+# and Peter Stone <pstone@cs.utexas.edu>, UT Austin, 2008
+
+import sys, time, random, os.path
+from ggp.kif import KIFParser, Message 
+from ggp.sim import PrologSimulator
+import logging
+import socket
+from threading import Thread
+from httplib import HTTPConnection
+
+# buffer time in seconds
+# this is the slack time given to players on top
+# of the normal start/play clock time
+BUFFER = 1
+
+class GameMaster:
+    def __init__(self):
+        self.sim = None
+        self.parser = KIFParser()
+
+    def sendMsg(self, role, msg):
+        host, port = self.players[role]
+        conn = HTTPConnection(host, port)
+        try:
+            conn.request('POST', '', str(msg))
+            try:
+                return conn.getresponse().read()
+            except socket.timeout:
+                logging.error('Timeout on: %s, %d' % self.players[role])
+        finally:
+            conn.close()
+        return None
+        
+    def start(self, role):
+        msg = Message('start')
+        msg.matchID = self.matchID
+        msg.sents = self.gd.initRules+self.gd.rules
+        msg.startClock = self.start_clock
+        msg.playClock = self.play_clock
+        msg.role = self.gd.roleTerm(role)
+        self.sendMsg(role, msg)
+
+    def play(self, role):
+        host, port = self.players[role]
+        conn = HTTPConnection(host, port)
+        msg = Message('play')
+        msg.matchID = self.matchID
+        if self.moves[0] != None:
+            msg.lastMoves = [self.gd.moveTerm(m) for m in self.moves]
+        response = self.sendMsg(role, msg)
+        if response:
+            move_term = self.parser.parse('Relation', response)
+            self.moves[role] = self.gd.moveIndex(move_term)
+        else:
+            self.moves[role] = None
+        
+    def stop(self, role):
+        host, port = self.players[role]
+        conn = HTTPConnection(host, port)
+        msg = Message('stop')
+        msg.matchID = self.matchID
+        msg.lastMoves = [self.gd.moveTerm(m) for m in self.moves]
+        self.sendMsg(role, msg)
+        
+    def doThreads(self, target):
+        if target == self.start:
+            timeout = self.start_clock
+        else:
+            timeout = self.play_clock
+        socket.setdefaulttimeout(timeout+BUFFER)
+        threads = []
+        for role in range(self.gd.numRoles()):
+            thread = Thread(target=target, args=(role,))
+            thread.start()
+            threads.append(thread)
+        for role in range(self.gd.numRoles()):
+            threads[role].join()
+
+    def run(self, gd, players, start_clock, play_clock):
+        self.start_clock = start_clock
+        self.play_clock = play_clock
+
+        # check number of players
+        if gd.numRoles() != len(players):
+            raise Exception('Role count: %d does not match Player count: %d' %\
+                            (gd.numRoles(), len(players)))
+
+        # create simulator
+        if self.sim:
+            self.sim.cleanup()
+	self.sim = PrologSimulator(gd)
+        self.gd = gd
+        self.players = players
+
+        self.matchID = 'match.%d' % int(time.time())
+
+        logging.info('MATCH: %s' % self.matchID)
+        logging.info('PLAYERS: %s' % self.players)
+        logging.info('START CLOCK: %d' % self.start_clock)
+        logging.info('PLAY CLOCK: %d' % self.play_clock)
+
+        # play game
+        self.doThreads(self.start)
+        self.state = self.gd.initialState
+        self.moves = [None] * self.gd.numRoles()
+        while not self.sim.isTerminal(self.state):
+            self.doThreads(self.play)
+            lm = self.sim.computeLegalMoves(self.state)
+            for num, player in enumerate(self.players):
+                if self.moves[num] not in lm[num]:
+                    logging.error('Illegal move received.')
+                    logging.error('Choosing random move for: %s, %d' % player)
+                    self.moves[num] = random.choice(lm[num])
+            self.state = self.sim.computeNextState(self.state, self.moves)
+        goals = self.sim.computeGoals(self.state)
+        logging.info('OUTCOME: %s' % zip(players, goals))
+        self.doThreads(self.stop)
+
+def usage():
+    sys.stderr.write('Usage: %s <game.kif> <start_clock> <play_clock> <host1> <port1> [<host2> <port2> ...]\n' % sys.argv[0])
+    sys.exit(1)
+
+def main():
+    # set log level
+    logging.basicConfig(level=logging.INFO) 
+
+    # check commandline arguments
+    if len(sys.argv) < 6: usage()
+    from ggp.gd import GameDescription
+    gd = GameDescription(sys.argv[1])
+    logging.info('GAME: %s' % os.path.basename(sys.argv[1]))
+    start_clock = int(sys.argv[2])
+    play_clock = int(sys.argv[3])
+    players = [(sys.argv[i], int(sys.argv[i+1])) for i in range(4, len(sys.argv), 2)]
+
+    # play single match
+    gm = GameMaster()
+    gm.run(gd, players, start_clock, play_clock)
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,436 @@
+#!/usr/bin/env python
+
+from threading import Thread
+from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
+from ggp.kif import *
+from ggp.gd import GameDescription
+from ggp.sim import CachedSimulator
+from ggp.heuristic import ConstantHeuristic
+from ggp.search import Search
+import time
+import sys
+import os
+import string
+import traceback
+import random
+import signal
+
+class TimeoutFunctionException(Exception):
+    """Exception to raise on a timeout"""
+    pass
+
+class TimeoutFunction:
+    def __init__(self, function, timeout):
+        self.timeout = int(timeout)
+        self.function = function
+        if self.timeout == 0:
+            raise TimeoutFunctionException()
+
+    def handle_timeout(self, signum, frame):
+        raise TimeoutFunctionException()
+
+    def __call__(self, *args):
+        old = signal.signal(signal.SIGALRM, self.handle_timeout)   
+        signal.alarm(self.timeout)     
+        try:                             
+            result = self.function(*args)  
+        finally:          
+            signal.signal(signal.SIGALRM, old)
+            signal.alarm(0)
+        return result 
+
+
+class PoliteThread(Thread):
+    def __init__(self, func):
+        Thread.__init__(self)
+        self.stop = False
+        self.func = func
+
+    def requestStop(self):
+	self.stop = True
+        
+    def stopRequested(self):
+	return self.stop
+
+    def run(self):
+        self.func()
+
+
+class GamePlayer(HTTPServer):
+    class GPHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            try:
+                self.server.lastMsgTime = time.time()
+                length = int(self.headers['content-length'])
+                text = self.rfile.read(length)
+                msg = self.server.parser.parse('Message', text)
+                print('Received ' + str(msg.msgType) + ' message of length: ' + str(length))
+                self.server.handler = self
+                self.server.processMessage(msg)
+                self.server.logMessage(msg)
+            except Exception, e:
+                sys.stderr.write('Error in incoming message: ' + str(e) + '\n')
+                traceback.print_exc()
+                return
+            try:
+                self.server.act()
+            except KeyboardInterrupt:
+                raise
+            except:
+                sys.stderr.write('Error in GamePlayer.act():\n')
+                traceback.print_exc()
+
+        def log_message(self, format, *args):
+            pass # suppress logging messages to stderr
+
+        def send(self, text):
+            self.send_response(200, 'OK')
+            self.send_header('Content-type', 'text/acl')
+            self.send_header('Content-length', str(len(text)))
+            self.end_headers()
+            self.wfile.write(string.upper(text))
+
+    def __init__(self, name, port, logging):
+        HTTPServer.__init__(self, ('', port), self.GPHandler)
+        self.name = name
+        self.logging = logging
+        self.matchID = None
+        self.sim = None
+        self.messageLog = None
+        self.playerLog = None
+        self.msgLogID = None
+        self.plyLogID = None
+        self.buffer = 1.0
+
+        self.parser = KIFParser()
+        self.prologParse = PrologParser()
+
+        self.logDir = os.path.join('log', time.strftime('%Y%m%d%H%M%S')+'_'+str(port))
+
+        if logging:
+            os.makedirs(self.logDir)
+
+    def handle_error(self, request, client_address):
+        try:
+            raise
+        except:
+            traceback.print_exc()
+
+    def logMessage(self, msg):
+        if self.logging:
+            if self.matchID != self.msgLogID:
+                self.msgLogID = self.matchID
+                filename = self.logDir + '/' + str(self.matchID) + '.msg'
+                try:
+                    if self.messageLog:
+                        self.messageLog.close()
+                    self.messageLog = open(filename, 'w')
+                except Exception:
+                    sys.stderr.write('Error: Cannot create message log: ' + \
+                                     filename + '\n')
+                    self.messageLog = None
+            if self.messageLog:
+                try:
+                    self.messageLog.write(str(msg) + '\n')
+                    self.messageLog.flush()
+                except Exception:
+                    sys.stderr.write('Error: Cannot write to message log\n')
+                    self.messageLog.close()
+                    self.messageLog = None
+
+    def logPrint(self, obj):
+        if self.logging:
+            if self.matchID != self.plyLogID:
+                self.plyLogID = self.matchID
+                filename = self.logDir + '/' + str(self.matchID) + '.ply'
+                try:
+                    if self.playerLog:
+                        self.playerLog.close()
+                    self.playerLog = open(filename, 'w')
+                except Exception:
+                    sys.stderr.write('Error: Cannot create player log: ' + \
+                                     filename + '\n')
+                    self.playerLog = None
+            if self.playerLog:
+                try:
+                    self.playerLog.write(str(obj) + '\n')
+                    # do not flush right away.  wait until send
+                except Exception:
+                    sys.stderr.write('Error: Cannot write to player log\n')
+                    self.playerLog.close()
+                    self.playerLog = None
+
+    def saveGameDescription(self, sents):
+        try:
+            outFile = open(self.logDir + '/' + str(self.matchID) + '.kif', 'w')
+            for s in sents:
+                outFile.write(str(s) + '\n')
+        except Exception, e:
+            sys.stderr.write('Unable to save game description: ' + str(e) + '\n')
+
+    def processMessage(self, msg):
+        if msg.msgType == 'start':
+            self.processStartMessage(msg)
+        elif msg.msgType == 'play':
+            self.processPlayMessage(msg)
+        elif msg.msgType == 'replay':
+            self.processReplayMessage(msg)
+        elif msg.msgType == 'stop':
+            self.processStopMessage(msg)
+        else:
+            raise Exception('Unknown message type: ' + str(msg.msgType))
+        
+    def processStartMessage(self, msg):
+        # Make sure Match ID is new
+        if msg.matchID == self.matchID:
+            raise Exception('Start message contains old match id: ' + \
+                            str(self.matchID))
+        self.matchID = msg.matchID
+
+        # Store clocks
+	self.startClock = msg.startClock
+	self.playClock = msg.playClock
+
+	# Process new game description
+        self.gd = GameDescription();
+        self.gd.processKIF(msg.sents)
+        if self.logging:
+            self.saveGameDescription(msg.sents)
+
+	# Get role
+	self.role = self.gd.roleIndex(msg.role)
+	
+	# Create a new cached simulator
+        if self.sim:
+            self.sim.cleanup()
+	self.sim = CachedSimulator(self.gd)
+
+        # Reset "state" to this game description's initial state
+	self.state = self.gd.initialState
+
+        self.status = 'init'
+
+    def processPlayMessage(self, msg):
+	# Make sure we're still in the same game
+        if msg.matchID != self.matchID:
+            raise Exception('Error: Match id in message: ' + str(msg.matchID) + \
+                            ' does not match current id: ' + str(self.matchID))
+
+	# Extract and convert the last moves
+	self.lastMoves = None
+        if msg.lastMoves:
+            self.lastMoves = [self.gd.moveIndex(x) for x in msg.lastMoves]
+	
+	# If the set of last moves is empty, then this is the
+	# initial state.  Otherwise, we need to advance to the
+	# next state
+        if self.lastMoves:
+	    self.state = self.sim.computeNextState(self.state, self.lastMoves)
+
+        self.status = 'play'
+	
+    def processReplayMessage(self, msg):
+	# Make sure we're still in the same game
+        if msg.matchID != self.matchID:
+            raise Exception('Error: Match id in message: ' + str(msg.matchID) + \
+                            ' does not match current id: ' + str(self.matchID))
+
+        self.status = 'play'
+
+    def processStopMessage(self, msg):
+	# Make sure we're still in the same game
+        if msg.matchID != self.matchID:
+            raise Exception('Error: Match id in message: ' + str(msg.matchID) + \
+                            ' does not match current id: ' + str(self.matchID))
+
+	# Extract and convert the last moves
+	lastMoves = [self.gd.moveIndex(x) for x in msg.lastMoves]
+	    
+	# Advance to final state
+	self.state = self.sim.computeNextState(self.state, lastMoves)
+
+	# If the final state isn't terminal according to us, then
+	# there is some kind of problem
+        if not self.sim.isTerminal(self.state):
+	    raise Exception('Error: Got stop message in non-terminal state')
+
+        self.status = 'done'
+
+    def recover(self, msgFile):
+        try:
+            text = open(msgFile, 'r').read()
+            lst = self.parser.parse('Messages', text)
+            for msg in lst:
+		self.processMessage(msg)
+                self.logMessage(msg)
+        except Exception, e:
+            raise Exception('Error in recovery: ' + str(e))
+
+    def updateReplyTime(self, clock):
+        self.replyTime = self.lastMsgTime + clock
+
+    def safeTimeLeft(self):
+        return self.replyTime - time.time() - self.buffer
+
+    def outOfTime(self):
+        return self.safeTimeLeft() <= 0
+
+    def response(self):
+        return str(self.gd.moveTerm(self.selectedMove))
+
+    def send(self, text):
+        self.handler.send(text)
+        print('Sent: ' + text)
+        self.logPrint('Sent: ' + text)
+        spareTime = self.replyTime - time.time()
+        self.logPrint('Spare time: ' + str(spareTime))
+        if spareTime < 0:
+            print '*** Negative Spare Time:', spareTime
+            self.buffer = max((self.buffer, min((abs(spareTime)+5, 0.25 * self.playClock))))
+            print '*** Adjusting spare time to:', self.buffer
+            self.logPrint('Adjusting spare time to: ' + str(self.buffer))
+        self.logPrint('---------------------------------------------------')
+        if self.playerLog:
+            self.playerLog.flush()
+
+    def act(self):
+        if self.status == 'init':
+            self.doInit()
+        elif self.status == 'play':
+            self.doPlay()
+        elif self.status == 'done':
+            self.doDone()
+        else:
+            raise Exception('Unknown status: ' + str(self.status))
+
+    def doInit(self):
+        self.updateReplyTime(self.startClock)
+        self.buffer = 1.0 # Reset time buffer before match
+        timeToInit = self.safeTimeLeft()
+        self.logPrint('Time to init: ' + str(timeToInit))
+        self.logPrint('Initial State:')
+        for index in self.state:
+            self.logPrint(self.gd.stateTerm(index))
+
+        # Choose strategy
+        self.heuristic = ConstantHeuristic(self.gd.averageReward())
+        self.search = Search(self.gd, self.sim, self.role, self.outOfTime, self.processResponse)
+
+        try:
+            warmupTimeout = TimeoutFunction(self.warmup, self.safeTimeLeft())
+            timeOut = False
+            try:
+                warmupTimeout()
+            except TimeoutFunctionException:
+                timeOut = True
+        finally:
+            self.send('ready')
+
+    def doPlay(self):
+        self.updateReplyTime(self.playClock)
+        self.logPrint('Last Moves:')
+        if self.lastMoves == None:
+            self.logPrint('None')
+        else:
+            self.logPrint([str(self.gd.moveTerm(idx)) for idx in self.lastMoves])
+        self.logPrint('State:')
+        for index in self.state:
+            self.logPrint(self.gd.stateTerm(index))
+        timeToAct = self.safeTimeLeft()
+        self.logPrint('Time to act: ' + str(timeToAct))
+
+        self.logPrint('Select Move:')
+        legal = self.sim.computeLegalMoves(self.state)[self.role]
+        self.selectedMove = random.choice(legal)
+
+        try:
+            selectMoveTimeout = TimeoutFunction(self.selectMove, self.safeTimeLeft())
+            timeOut = False
+            maxOpp = -1
+            try:
+                selectMoveTimeout(maxOpp)
+            except TimeoutFunctionException:
+                timeOut = True
+        finally:
+            self.send(self.response())
+
+    def doDone(self):
+        self.updateReplyTime(float('inf'))
+
+        self.logPrint('Last Moves:')
+        if self.lastMoves == None:
+            self.logPrint('None')
+        else:
+            self.logPrint([str(self.gd.moveTerm(idx)) for idx in self.lastMoves])
+        self.logPrint('State:')
+        for index in self.state:
+            self.logPrint(self.gd.stateTerm(index))
+
+        goals = self.sim.computeGoals(self.state)
+        self.logPrint('Goals: ' + str(goals)) 
+        print('Goal: ' + str(goals[self.role]))
+
+        self.send('done')
+
+    def processResponse(self, sr):
+        self.logPrint('Got response: ' + str(sr))
+        self.selectedMove = sr.bestMove
+
+    def warmup(self):
+        """
+        Warm-up procedure.  Put code here to 
+        run during the init clock before the 
+        match begins.
+        """
+        pass
+
+    def selectMove(self, maxOpp):
+        """
+        Move selection.  Put code here to 
+        run during the play clock while the
+        match is proceeding.
+        """
+        self.search.search(self.state, self.heuristic, maxOppMoves = maxOpp)
+
+
+from optparse import OptionParser
+
+DEFAULT_NAME = 'TestPlayer'
+DEFAULT_PORT = 5600
+DEFAULT_LOGGING = True
+
+def main():
+    parser = OptionParser()
+    parser.add_option('-n', '--name', dest='name',
+                      help='set name to NAME', metavar='NAME',
+                      default=DEFAULT_NAME)
+    parser.add_option('-p', '--port', dest='port',
+                      help='set listening port to PORT', metavar='PORT',
+                      default=DEFAULT_PORT)
+    parser.add_option('-l', '--log', dest='logging',
+                      help='enable logging',
+                      action='store_true', default=DEFAULT_LOGGING)
+    parser.add_option('-q', '--quiet', dest='logging',
+                      help='disable logging',
+                      action='store_false', default=DEFAULT_LOGGING)
+    parser.add_option('-r', '--recover', dest='recoverFile',
+                      help='recover from message FILE', metavar='FILE')
+    (opts, args) = parser.parse_args()
+    print('Option Name:    ' + opts.name)
+    print('Option Logging: ' + { True: 'on', False: 'off' }[opts.logging])
+
+    gp = GamePlayer(opts.name, int(opts.port), opts.logging)
+    if opts.recoverFile:
+        print 'GamePlayer recovering from message file: ' + \
+              str(opts.recoverFile)
+        gp.recover(opts.recoverFile)
+    try:
+        print 'GamePlayer waiting for connection on port ' + \
+              str(opts.port) + '...'
+        gp.serve_forever()
+    except KeyboardInterrupt:
+        print '^C received.  Shutting down player...'
+        gp.socket.close()
+
+if __name__ == '__main__':
+    main()

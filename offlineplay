@@ -1,0 +1,49 @@
+#!/usr/bin/env python
+
+import sys
+from ggp.player import *
+from ggp.sim import CachedSimulator
+from ggp.gd import GameDescription
+
+# number of matches to play in a row before quitting
+NUM_MATCHES = 50
+
+def main():
+    gd = GameDescription(sys.argv[1])
+    sim = CachedSimulator(gd)
+    players = [None] * gd.numRoles()
+
+    # Set first player's policy
+    # players[0] = RandomPlayer(0)
+    players[0] = AlphaBetaPlayer(gd, sim, 0)
+
+    # Make remaining players (if any) random
+    for i in xrange(1, gd.numRoles()):
+        players[i] = RandomPlayer(i)
+
+    num_matches = 0
+    p1_goals = 0
+    for i in xrange(NUM_MATCHES):
+        print "Match #%d" % (i+1)
+        try:
+            state = gd.initialState
+            while not sim.isTerminal(state):
+                lm = sim.computeLegalMoves(state)
+                moves = [p.act(state, lm) for p in players]
+                print "  Moves:", [str(gd.moveTerm(x)) for x in moves]
+                state = sim.computeNextState(state, moves)
+            goals = sim.computeGoals(state)
+            for p in players:
+                p.processReward(goals)
+            print "  Goals: %s\n" % goals
+            p1_goals += goals[0]
+            num_matches += 1
+        except KeyboardInterrupt:
+            print '^C pressed. Shutting down.\n'
+            break
+    print 'Completed %d match%s' % (num_matches, '' if num_matches==1 else 'es')
+    print 'Player #1 Average: %.2f' % (float(p1_goals) / num_matches)
+     
+if __name__ == '__main__':
+    main()
+        
