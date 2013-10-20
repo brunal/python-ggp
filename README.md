@@ -1,7 +1,10 @@
-Copyright 2008, Greg Kuhlmann <greg.kuhlmann@gmail.com>,
-Peter Stone <pstone@cs.utexas.edu>
-Free to modify and distribute if original copyright
-notice is included.
+Python-GGP
+==========
+
+Python framework for General Game Playing.
+
+Python code developed in the course of Gregory Kuhlmann's dissertation work at the University of Texas at Austin.
+Imported from SVN hosted on Googlecode.
 
 Dependencies:
   Python: >= 2.6
