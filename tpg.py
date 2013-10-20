@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 
 """Toy Parser Generator is a lexical and syntactic parser generator
 for Python. This generator was born from a simple statement: YACC

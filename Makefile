@@ -7,9 +7,9 @@ SWIPL_INCLUDES=
 SWIPL_LIBS=-lswipl
 
 # Get Python Version
-PYTHON_VERSION=`python -c "import distutils.sysconfig as sc;print sc.get_config_var('VERSION')"`
+PYTHON_VERSION=`python2 -c "import distutils.sysconfig as sc;print sc.get_config_var('VERSION')"`
 # Find location of Python.h
-PYTHON_INCLUDES=`python -c "import distutils.sysconfig as sc;print '-I'+sc.get_python_inc()"`
+PYTHON_INCLUDES=`python2 -c "import distutils.sysconfig as sc;print '-I'+sc.get_python_inc()"`
 # Python libraries
 PYTHON_LIBS=-lpython${PYTHON_VERSION}
 
